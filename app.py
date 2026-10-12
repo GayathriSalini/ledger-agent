@@ -100,6 +100,12 @@ def answer_question(question):
     if not data:
         return 0
 
+    if (
+        any(x in q for x in ("how many", "number of", "count of", "count the"))
+        and "customer" in q
+    ):
+        return len({o["customer"] for o in data})
+
     if any(x in q for x in ("how many", "number of", "count of", "count the")):
         return len(data)
 
