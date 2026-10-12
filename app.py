@@ -1,15 +1,21 @@
 
 import json
+import os
 import re
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
+from zoneinfo import ZoneInfo
 
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-INDIA_TZ = timezone(timedelta(hours=5, minutes=30))
+DATA_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "orders.ndjson",
+)
+IST = ZoneInfo("Asia/Kolkata")
 
 RATES = {
     "USD": Decimal("1"),
@@ -17,46 +23,28 @@ RATES = {
     "INR": Decimal("0.01161"),
 }
 
-MONTHS = {
-    "january": 1,
-    "february": 2,
-    "march": 3,
-    "april": 4,
-    "may": 5,
-    "june": 6,
-    "july": 7,
-    "august": 8,
-    "september": 9,
-    "october": 10,
-    "november": 11,
-    "december": 12,
-}
-
-
-def parse_time(value):
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
 
 def load_orders():
-    # Keep the latest updated version of each order.
     latest = {}
 
-    with open("orders.ndjson", encoding="utf-8") as file:
+    with open(DATA_FILE, "r", encoding="utf-8") as file:
         for line in file:
             if not line.strip():
                 continue
 
             order = json.loads(line)
-            order_id = order["id"]
-            previous = latest.get(order_id)
+            order_id = str(order.get("id", ""))
+
+            if not order_id:
+                continue
+
+            updated = str(order.get("updated_at", ""))
 
             if (
-                previous is None
-                or parse_time(order["updated_at"])
-                > parse_time(previous["updated_at"])
+                order_id not in latest
+                or updated > str(
+                    latest[order_id].get("updated_at", "")
+                )
             ):
                 latest[order_id] = order
 
@@ -66,228 +54,373 @@ def load_orders():
 ORDERS = load_orders()
 
 
-def usd(order):
-    currency = order["currency"]
-    if currency not in RATES:
-        raise ValueError(f"Unsupported currency: {currency}")
+def normalize(value):
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
-    return Decimal(str(order["amount"])) * RATES[currency]
+
+def usd(order):
+    currency = str(order.get("currency", "USD")).upper()
+    rate = RATES.get(currency)
+
+    if rate is None:
+        return Decimal("0")
+
+    return Decimal(str(order.get("amount", 0))) * rate
 
 
 def money(value):
     return float(
-        Decimal(value).quantize(
+        Decimal(str(value)).quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
         )
     )
 
 
-def month_filter(question):
-    q = question.lower()
+def order_date(order, field="created_at"):
+    value = order.get(field)
 
-    for name, number in MONTHS.items():
-        if re.search(r"\b" + name + r"\b", q):
-            year_match = re.search(r"\b(20\d{2})\b", q)
-            year = int(year_match.group(1)) if year_match else None
-            return number, year
+    if not value:
+        return None
 
-    return None, None
+    try:
+        dt = datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=IST)
+
+        return dt.astimezone(IST)
+    except (ValueError, TypeError):
+        return None
 
 
 def filter_orders(question):
-    q = question.lower()
+    q = normalize(question)
     data = ORDERS[:]
 
-    # Explicit status filters take priority.
-    if re.search(r"\b(refund|refunded|refunds)\b", q):
-        data = [o for o in data if o["status"] == "refunded"]
+    # Status filter
+    if "refunded" in q or "refund" in q:
+        data = [
+            o for o in data
+            if normalize(o.get("status")) == "refunded"
+        ]
+    elif any(word in q for word in ("void", "cancelled", "canceled")):
+        data = [
+            o for o in data
+            if normalize(o.get("status")) == "void"
+        ]
+    elif any(
+        word in q
+        for word in (
+            "paid", "revenue", "sales", "sold", "selling",
+            "earned", "worth", "order value",
+        )
+    ):
+        data = [
+            o for o in data
+            if normalize(o.get("status")) == "paid"
+        ]
 
-    elif re.search(r"\b(void|voided|cancelled|canceled)\b", q):
-        data = [o for o in data if o["status"] == "void"]
-
-    elif re.search(r"\b(paid|revenue|sales|sold|earning|earnings)\b", q):
-        data = [o for o in data if o["status"] == "paid"]
-
-    # Region.
-    for region in ("North", "South", "East", "West", "Central"):
+    # Region filter
+    for region in ("Central", "East", "North", "South", "West"):
         if re.search(r"\b" + region.lower() + r"\b", q):
             data = [
                 o for o in data
-                if o["region"].lower() == region.lower()
+                if normalize(o.get("region")) == region.lower()
             ]
             break
 
-    # Product: use exact product names from the data.
+    # Product filter
     products = sorted(
-        {o["product"] for o in ORDERS},
+        {
+            str(o.get("product", ""))
+            for o in ORDERS
+            if o.get("product")
+        },
         key=len,
         reverse=True,
     )
 
     for product in products:
-        if re.search(
-            r"(?<!\w)" + re.escape(product.lower()) + r"(?!\w)",
+        if normalize(product) in q:
+            data = [
+                o for o in data
+                if normalize(o.get("product")) == normalize(product)
+            ]
+            break
+
+    # Customer ID filter
+    customer_ids = {
+        str(o.get("customer", "")).upper()
+        for o in ORDERS
+        if o.get("customer")
+    }
+
+    for customer_id in customer_ids:
+        if customer_id.lower() in q:
+            data = [
+                o for o in data
+                if str(o.get("customer", "")).upper() == customer_id
+            ]
+            break
+
+    # Order ID filter
+    order_ids = {str(o.get("id", "")) for o in ORDERS}
+
+    for order_id in order_ids:
+        if order_id and re.search(
+            r"\b" + re.escape(order_id.lower()) + r"\b",
             q,
         ):
             data = [
                 o for o in data
-                if o["product"].lower() == product.lower()
+                if str(o.get("id", "")) == order_id
             ]
             break
 
-    # Customer ID.
-    customer_match = re.search(r"\bC\d{4}\b", question, re.I)
+    # Month and year filter, using Asia/Kolkata business dates
+    months = {
+        "january": 1, "jan": 1,
+        "february": 2, "feb": 2,
+        "march": 3, "mar": 3,
+        "april": 4, "apr": 4,
+        "may": 5,
+        "june": 6, "jun": 6,
+        "july": 7, "jul": 7,
+        "august": 8, "aug": 8,
+        "september": 9, "sep": 9, "sept": 9,
+        "october": 10, "oct": 10,
+        "november": 11, "nov": 11,
+        "december": 12, "dec": 12,
+    }
 
-    if customer_match:
-        customer_id = customer_match.group().upper()
+    month_num = None
+    year_num = None
+
+    for name, number in months.items():
+        match = re.search(r"\b" + name + r"\s+(\d{4})\b", q)
+
+        if match:
+            month_num = number
+            year_num = int(match.group(1))
+            break
+
+    if month_num is None:
+        match = re.search(r"\b(\d{4})-(\d{1,2})\b", q)
+
+        if match:
+            year_num = int(match.group(1))
+            month_num = int(match.group(2))
+
+    if month_num is not None and year_num is not None:
         data = [
             o for o in data
-            if o["customer"].upper() == customer_id
-        ]
-
-    # Month and year are interpreted in Asia/Kolkata.
-    month, year = month_filter(q)
-
-    if month is not None:
-        filtered = []
-
-        for order in data:
-            dt = parse_time(order["created_at"]).astimezone(INDIA_TZ)
-
-            if dt.month == month and (
-                year is None or dt.year == year
-            ):
-                filtered.append(order)
-
-        data = filtered
-
-    # Specific order ID.
-    order_match = re.search(r"\bORD-\d+\b", question, re.I)
-
-    if order_match:
-        order_id = order_match.group().upper()
-        data = [
-            o for o in data
-            if o["id"].upper() == order_id
+            if (
+                order_date(o) is not None
+                and order_date(o).year == year_num
+                and order_date(o).month == month_num
+            )
         ]
 
     return data
 
 
 def is_count_question(q):
-    return (
-        any(
-            phrase in q
-            for phrase in (
-                "how many",
-                "number of",
-                "count of",
-                "count the",
-                "count all",
-                "total number",
-            )
+    return any(
+        phrase in q
+        for phrase in (
+            "how many",
+            "number of",
+            "count of",
+            "count the",
+            "how much",
         )
-        or q.startswith("count ")
     )
 
 
 def is_ranking_question(q):
-    return any(
-        phrase in q
-        for phrase in (
-            "top-selling",
-            "top selling",
-            "best-selling",
-            "best selling",
-            "bestselling",
-            "highest",
-            "most revenue",
-            "most sales",
-            "largest revenue",
-            "highest revenue",
-            "highest sales",
-            "top product",
-            "leading product",
-        )
+    ranking_words = (
+        "top",
+        "highest",
+        "most",
+        "best-selling",
+        "best selling",
+        "bestselling",
+        "greatest",
+        "largest",
+        "leading",
+        "lowest",
+        "least",
+        "fewest",
+    )
+
+    metric_words = (
+        "revenue",
+        "sales",
+        "selling",
+        "earned",
+        "units",
+        "quantity",
+        "orders",
+        "customers",
+    )
+
+    return (
+        any(word in q for word in ranking_words)
+        and any(word in q for word in metric_words)
     )
 
 
 def answer_question(question):
-    q = question.lower().strip()
-    data = filter_orders(question)
+    q = normalize(question)
+    data = filter_orders(q)
 
     if not data:
         return 0
 
-    # RANKINGS must be handled before totals, counts, and averages.
-    # Otherwise a "top product by revenue" question may return a
-    # monetary total instead of the product name.
+    # Handle distinct-customer counts BEFORE ranking questions.
+    if (
+        is_count_question(q)
+        and "customer" in q
+        and any(
+            word in q
+            for word in ("different", "distinct", "unique")
+        )
+    ):
+        return len({
+            str(o.get("customer", ""))
+            for o in data
+            if o.get("customer")
+        })
+
+    # Ranking questions
     if is_ranking_question(q):
-        if "product" in q or "top-selling" in q or "top selling" in q:
-            totals = defaultdict(lambda: Decimal("0"))
-
-            for order in data:
-                totals[order["product"]] += usd(order)
-
-            if not totals:
-                return 0
-
-            return max(totals, key=totals.get)
-
-        if "customer" in q or "customers" in q:
-            totals = defaultdict(lambda: Decimal("0"))
-
-            for order in data:
-                totals[order["customer"]] += usd(order)
-
-            return max(totals, key=totals.get) if totals else 0
+        if any(
+            word in q
+            for word in ("unit", "quantity", "quantities")
+        ):
+            metric = "units"
+        elif "customer" in q:
+            metric = "customers"
+        elif "order" in q and not any(
+            word in q for word in ("revenue", "sales", "earned")
+        ):
+            metric = "orders"
+        else:
+            metric = "revenue"
 
         if "region" in q:
-            totals = defaultdict(lambda: Decimal("0"))
+            entity_field = "region"
+        elif "customer" in q:
+            entity_field = "customer"
+        elif "product" in q or any(
+            phrase in q
+            for phrase in (
+                "top-selling", "top selling",
+                "best-selling", "best selling",
+                "bestselling",
+            )
+        ):
+            entity_field = "product"
+        else:
+            entity_field = "product"
 
-            for order in data:
-                totals[order["region"]] += usd(order)
+        totals = defaultdict(Decimal)
 
-            return max(totals, key=totals.get) if totals else 0
+        for order in data:
+            key = str(order.get(entity_field, ""))
 
-    # Average must come before generic count handling because
-    # average questions can also contain the words "how many".
-    if any(
-        word in q
-        for word in ("average", "avg", "on average", "mean")
-    ):
-        return money(
-            sum((usd(o) for o in data), Decimal("0")) / len(data)
+            if not key:
+                continue
+
+            if metric == "units":
+                totals[key] += Decimal(str(order.get("qty", 0)))
+            elif metric == "customers":
+                totals[key] += Decimal("1")
+            elif metric == "orders":
+                totals[key] += Decimal("1")
+            else:
+                totals[key] += usd(order)
+
+        if not totals:
+            return 0
+
+        reverse = not any(
+            word in q for word in ("lowest", "least", "fewest")
         )
 
-    # Distinct customers, not the number of orders.
-    if is_count_question(q) and (
-        "customer" in q or "customers" in q
-    ):
-        return len({o["customer"] for o in data})
+        winner = sorted(
+            totals.items(),
+            key=lambda item: (item[1], item[0].lower()),
+            reverse=reverse,
+        )[0]
 
-    # Number of orders.
-    if is_count_question(q) or "how many orders" in q:
+        asks_for_value = any(
+            phrase in q
+            for phrase in (
+                "how much",
+                "what amount",
+                "what was the revenue",
+                "what was the sales",
+                "how many units",
+                "how many orders",
+                "revenue of",
+                "sales of",
+            )
+        )
+
+        if asks_for_value:
+            if metric == "revenue":
+                return money(winner[1])
+
+            if winner[1] == winner[1].to_integral_value():
+                return int(winner[1])
+
+            return float(winner[1])
+
+        return winner[0]
+
+    # Average must precede generic count handling.
+    if any(word in q for word in ("average", "avg", "mean")):
+        total = sum((usd(o) for o in data), Decimal("0"))
+        return money(total / Decimal(len(data)))
+
+    # Other distinct-customer questions
+    if (
+        is_count_question(q)
+        and "customer" in q
+        and any(
+            word in q
+            for word in ("different", "distinct", "unique")
+        )
+    ):
+        return len({
+            str(o.get("customer", ""))
+            for o in data
+            if o.get("customer")
+        })
+
+    # General counts
+    if is_count_question(q):
+        if any(word in q for word in ("units", "quantity", "items")):
+            return sum(int(o.get("qty", 0)) for o in data)
+
         return len(data)
 
-    # Quantity of units, rather than number of orders.
+    # Revenue and monetary totals
     if any(
         word in q
-        for word in ("quantity", "units", "items", "pieces")
-    ) and not any(
-        word in q
         for word in (
-            "revenue", "sales", "amount", "value",
-            "money", "usd", "dollar", "average",
+            "revenue", "sales", "earned", "total amount",
+            "total value", "in usd", "dollars",
         )
     ):
-        return sum(int(o["qty"]) for o in data)
+        return money(sum((usd(o) for o in data), Decimal("0")))
 
-    # Default: total amount in USD.
-    return money(
-        sum((usd(o) for o in data), Decimal("0"))
-    )
+    # Default: total revenue in USD
+    return money(sum((usd(o) for o in data), Decimal("0")))
 
 
 @app.get("/")
@@ -299,25 +432,27 @@ def health():
 
 
 @app.post("/")
-def ask():
+def answer():
     body = request.get_json(silent=True) or {}
     question = body.get("question")
 
     if not isinstance(question, str) or not question.strip():
         return jsonify({
-            "error": "Provide a non-empty question"
+            "error": "Please provide a non-empty question."
         }), 400
 
     try:
-        answer = answer_question(question)
-        return jsonify({"answer": answer})
-
+        result = answer_question(question)
+        return jsonify({"answer": result})
     except Exception:
-        app.logger.exception("Could not answer question")
+        app.logger.exception("Failed to answer question")
         return jsonify({
-            "error": "Could not answer question"
+            "error": "Unable to answer question."
         }), 500
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=False)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "5000")),
+    )
