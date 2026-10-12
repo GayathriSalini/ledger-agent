@@ -100,6 +100,9 @@ def answer_question(question):
     if not data:
         return 0
 
+    if any(x in q for x in ("average", "avg")):
+        return money(sum((usd(o) for o in data), Decimal("0")) / len(data))
+
     if (
         any(x in q for x in ("how many", "number of", "count of", "count the"))
         and "customer" in q
@@ -108,9 +111,6 @@ def answer_question(question):
 
     if any(x in q for x in ("how many", "number of", "count of", "count the")):
         return len(data)
-
-    if any(x in q for x in ("average", "avg")):
-        return money(sum((usd(o) for o in data), Decimal("0")) / len(data))
 
     if any(x in q for x in ("quantity", "units", "items")) and not any(
         x in q for x in ("revenue", "sales", "amount", "value", "money", "usd", "dollar")
